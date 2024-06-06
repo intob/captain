@@ -1,0 +1,12 @@
+Captain is an all-in-one remote machine controller. This allows simple, efficient and scalable control of remote machines with dynamic IP addresses.
+
+1. Start an instance with -mode serve
+    captain -mode serve -key mykey
+
+2. Start instance(s) with -mode obey
+    captain -mode obey -key mykey -target http://my.server:1992
+
+3. Send commands to the server (the default is -mode send)
+    captain -key mykey -target http://my.server:1992 echo hello_world
+
+By default, the obeying instances poll for the command every 10 seconds.
