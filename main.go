@@ -51,7 +51,7 @@ func main() {
 		if err != nil {
 			panic(err)
 		}
-	case "obey": // poll target for command
+	case "obey":
 		var lastSum []byte
 		for {
 			time.Sleep(*poll)
