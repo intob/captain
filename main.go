@@ -30,6 +30,11 @@ type cmd struct {
 	Sum     string
 }
 
+type log struct {
+	Msg, Sum string
+	Created  time.Time
+}
+
 func main() {
 	key := flag.String("key", "", "authentication token")
 	mode := flag.String("mode", "send", "operating mode: send | serve | obey")
@@ -40,6 +45,7 @@ func main() {
 		fmt.Println("missing key")
 		os.Exit(1)
 	}
+	*target = strings.TrimSuffix(*target, "/")
 	keySum := blake3.Sum256([]byte(*key))
 	hasher := blake3.New(32, keySum[:])
 	switch strings.ToLower(*mode) {
@@ -75,17 +81,21 @@ func main() {
 			if bytes.Equal(csum, lastSum) {
 				continue
 			}
-			// cmd cannot be replayed after poll duration
-			err = verify(c, hasher, *poll)
-			if err != nil {
+			if err = verifyCmd(c, hasher, *poll); err != nil {
 				fmt.Println(err)
 				continue
 			}
+			lastSum = csum
 			fmt.Printf("will execute: %+v\n", c)
 			oscmd := exec.Command(c.Name, c.Args...)
-			err = oscmd.Run()
+			out, err := oscmd.Output()
+			if out != nil {
+				fmt.Println(string(out))
+				postLogMsg(string(out), hasher, *target)
+			}
 			if err != nil {
 				fmt.Println(err)
+				postLogMsg(err.Error(), hasher, *target)
 			}
 		}
 	case "send":
@@ -100,13 +110,13 @@ func main() {
 		if flag.NArg() > 1 {
 			c.Args = append(c.Args, flag.Args()[1:]...)
 		}
-		c.Sum = hex.EncodeToString(sign(c, hasher))
+		c.Sum = hex.EncodeToString(signCmd(c, hasher))
 		payload, err := json.Marshal(c)
 		if err != nil {
 			panic(err)
 		}
 		buf := bytes.NewBuffer(payload)
-		resp, err := http.Post(*target, "application/json", buf)
+		resp, err := http.Post(*target+"/cmd", "application/json", buf)
 		if err != nil {
 			panic(err)
 		}
@@ -120,33 +130,77 @@ func main() {
 	}
 }
 
+func postLogMsg(msg string, h *blake3.Hasher, target string) error {
+	l := &log{Msg: msg, Created: time.Now()}
+	l.Sum = hex.EncodeToString(signLog(l, h))
+	payload, err := json.Marshal(l)
+	if err != nil {
+		return err
+	}
+	buf := bytes.NewBuffer(payload)
+	resp, err := http.Post(target+"/log", "application/json", buf)
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("got non-ok status code: %d", resp.StatusCode)
+	}
+	return nil
+}
+
 func (a *app) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case "GET":
 		w.Write(a.payload)
 	case "POST":
-		dec := json.NewDecoder(r.Body)
-		c := &cmd{}
-		err := dec.Decode(c)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
+		switch r.URL.Path {
+		case "/cmd":
+			a.handlePostCmd(w, r)
+		case "/log":
+			a.handlePostLog(w, r)
 		}
-		err = verify(c, a.hasher, 200*time.Millisecond) // 200ms should be ok
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusUnauthorized)
-			return
-		}
-		a.payload, err = json.Marshal(c)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		w.Write([]byte("ok"))
 	}
 }
 
-func sign(c *cmd, h *blake3.Hasher) []byte {
+func (a *app) handlePostCmd(w http.ResponseWriter, r *http.Request) {
+	dec := json.NewDecoder(r.Body)
+	c := &cmd{}
+	err := dec.Decode(c)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	err = verifyCmd(c, a.hasher, 200*time.Millisecond)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusUnauthorized)
+		return
+	}
+	a.payload, err = json.Marshal(c)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Write([]byte("ok"))
+}
+
+func (a *app) handlePostLog(w http.ResponseWriter, r *http.Request) {
+	dec := json.NewDecoder(r.Body)
+	l := &log{}
+	err := dec.Decode(l)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	err = verifyLog(l, a.hasher, 200*time.Millisecond)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusUnauthorized)
+		return
+	}
+	w.Write([]byte("ok"))
+	fmt.Printf("%s: %s\n%s\n", l.Created, r.RemoteAddr, l.Msg)
+}
+
+func signCmd(c *cmd, h *blake3.Hasher) []byte {
 	h.Reset()
 	h.Write(ttb(c.Created))
 	h.Write([]byte(c.Name))
@@ -156,9 +210,7 @@ func sign(c *cmd, h *blake3.Hasher) []byte {
 	return h.Sum(nil)
 }
 
-func verify(c *cmd, h *blake3.Hasher, ttl time.Duration) error {
-	// Don't accept payloads older than 200ms to prevent replays.
-	// Not perfect, but good enough for now.
+func verifyCmd(c *cmd, h *blake3.Hasher, ttl time.Duration) error {
 	if time.Since(c.Created) > ttl {
 		return errors.New("payload expired")
 	}
@@ -166,14 +218,28 @@ func verify(c *cmd, h *blake3.Hasher, ttl time.Duration) error {
 	if err != nil {
 		return fmt.Errorf("failed to decode sig hex: %w", err)
 	}
-	h.Reset()
-	h.Write(ttb(c.Created))
-	h.Write([]byte(c.Name))
-	for _, arg := range c.Args {
-		h.Write([]byte(arg))
+	if !bytes.Equal(signCmd(c, h), csum) {
+		return errors.New("invalid checksum")
 	}
-	sum := h.Sum(nil)
-	if !bytes.Equal(sum, csum) {
+	return nil
+}
+
+func signLog(l *log, h *blake3.Hasher) []byte {
+	h.Reset()
+	h.Write(ttb(l.Created))
+	h.Write([]byte(l.Msg))
+	return h.Sum(nil)
+}
+
+func verifyLog(l *log, h *blake3.Hasher, ttl time.Duration) error {
+	if time.Since(l.Created) > ttl {
+		return errors.New("payload expired")
+	}
+	lsum, err := hex.DecodeString(l.Sum)
+	if err != nil {
+		return fmt.Errorf("failed to decode sig hex: %w", err)
+	}
+	if !bytes.Equal(signLog(l, h), lsum) {
 		return errors.New("invalid checksum")
 	}
 	return nil
