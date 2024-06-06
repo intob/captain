@@ -135,6 +135,7 @@ func (a *app) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		err = verify(c, a.hasher, 200*time.Millisecond) // 200ms should be ok
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusUnauthorized)
+			return
 		}
 		a.payload, err = json.Marshal(c)
 		if err != nil {
