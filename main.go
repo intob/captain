@@ -24,10 +24,9 @@ type app struct {
 }
 
 type cmd struct {
-	Name    string
-	Args    []string
-	Created time.Time
-	Sum     string
+	Name, Sum string
+	Args      []string
+	Created   time.Time
 }
 
 type log struct {
